@@ -1,0 +1,521 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+<title>Retarget — Mixamo IK</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #202028; }
+  #canvas { display: block; }
+  #status, #hint {
+    position: fixed; color: #fff; font: 13px/1.4 monospace;
+    background: rgba(0,0,0,.55); padding: 6px 10px; border-radius: 4px;
+    pointer-events: none; white-space: pre;
+  }
+  #status { top: 8px; left: 8px; max-width: min(720px, calc(100vw - 40px)); }
+  #hint { bottom: 8px; left: 8px; color: #bbb; font-size: 12px; white-space: normal; max-width: calc(100vw - 32px); }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="status">loading…</div>
+<div id="hint">WASD · QE · Shift · Wheel — speed · <b>1..9 — animations</b> · I — IK for all animations ON/OFF</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./js/0_three/three_185.js",
+    "three/addons/": "./js/0_three/"
+  }
+}
+</script>
+
+<script type="module">
+"use strict";
+
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { Rig, retarget_clip, prepare_clip, detect_unit_scale } from "./js/retarget.js";
+
+// Each source animation has its own initial IK setting. Pressing I overrides
+// these per-clip defaults globally: first ON, then OFF, then ON, and so on.
+const anim_urls = [
+  { url: "./models/animation_1_rifle_stand_walk_default.glb", ik: true, arm_space: 50 },
+  { url: "./models/animation_2_rifle_crouch_aiming_to_knee_default.glb", ik: true, loop: false, arm_space: 50 },
+  { url: "./models/animation_3_rifle_knee_turn_left_90_aiming.glb", ik: true, loop: false, arm_space: 50 },
+  { url: "./models/animation_4_rifle_stand_default_to_knee_default.glb", ik: true, loop: false, arm_space: 50 },
+  { url: "./models/animation_5_rifle_stand_run_aiming.glb", ik: true, arm_space: 50 },
+  { url: "./models/animation_6_pistol_stand_wall_peek_left_shot_aiming.glb", ik: true, arm_space: 50 },
+  { url: "./models/animation_7_rifle_stand_idle_aiming.glb", ik: true, arm_space: 50 },
+  { url: "./models/animation_8_rifle_knee_default_to_stand_default.glb", ik: true, loop: false, arm_space: 50 },
+  { url: "./models/animation_9_knee_default_to_prone.glb", ik: true, loop: false, arm_space: 50 },
+];
+const soldier_url = "./models/soldier.glb";
+const gentleman_urls = [
+  "./models/gentleman1.glb",
+  "./models/gentleman2.glb",
+  "./models/gentleman3.glb",
+  "./models/gentleman4.glb",
+  "./models/gentleman5.glb",
+  "./models/gentleman6.glb",
+];
+
+class flight_controls {
+  constructor(camera, domElement) {
+    this.camera = camera; this.domElement = domElement; this.enabled = true;
+    this.speed = 2.0; this.boostMul = 5.0;
+    this.minSpeed = 0.05; this.maxSpeed = 100.0;
+    this.lookSpeed = 0.0022;
+    this.yaw = 0; this.pitch = 0;
+    this._locked = false;
+    this._keys = new Set();
+    this._euler = new THREE.Euler(0, 0, 0, "YXZ");
+    this._fwd = new THREE.Vector3(); this._right = new THREE.Vector3(); this._move = new THREE.Vector3();
+    this._onKeyDown = null;
+    this.sync(); this._bind();
+  }
+  sync() { this._euler.setFromQuaternion(this.camera.quaternion, "YXZ"); this.yaw = this._euler.y; this.pitch = this._euler.x; }
+  setKeyHandler(fn) { this._onKeyDown = fn; }
+  _bind() {
+    const el = this.domElement;
+    el.addEventListener("click", () => { if (!this._locked) el.requestPointerLock(); });
+    document.addEventListener("pointerlockchange", () => { this._locked = document.pointerLockElement === el; });
+    document.addEventListener("mousemove", e => {
+      if (!this._locked) return;
+      this.yaw -= e.movementX * this.lookSpeed;
+      this.pitch -= e.movementY * this.lookSpeed;
+      const limit = Math.PI / 2 - 0.01;
+      this.pitch = THREE.MathUtils.clamp(this.pitch, -limit, limit);
+    });
+    window.addEventListener("keydown", e => {
+      if (e.repeat && this._onKeyDown && /^(Digit\d|KeyI)$/.test(e.code)) return;
+      if (this._onKeyDown && this._onKeyDown(e.code)) return;
+      if (!this._locked) return;
+      this._keys.add(e.code);
+      if (e.code === "Space") e.preventDefault();
+    }, { passive: false });
+    window.addEventListener("keyup", e => this._keys.delete(e.code));
+    window.addEventListener("blur", () => this._keys.clear());
+    el.addEventListener("wheel", e => {
+      if (!this._locked) return;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      this.speed = THREE.MathUtils.clamp(this.speed * factor, this.minSpeed, this.maxSpeed);
+    }, { passive: true });
+  }
+  update(dt) {
+    if (!this.enabled) return;
+    this._euler.set(this.pitch, this.yaw, 0, "YXZ");
+    this.camera.quaternion.setFromEuler(this._euler);
+    if (!this._locked) return;
+    const boost = (this._keys.has("ShiftLeft") || this._keys.has("ShiftRight")) ? this.boostMul : 1;
+    const step = this.speed * boost * dt;
+    this._fwd.set(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    this._right.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    this._move.set(0, 0, 0);
+    if (this._keys.has("KeyW")) this._move.add(this._fwd);
+    if (this._keys.has("KeyS")) this._move.sub(this._fwd);
+    if (this._keys.has("KeyD")) this._move.add(this._right);
+    if (this._keys.has("KeyA")) this._move.sub(this._right);
+    if (this._keys.has("KeyE") || this._keys.has("Space")) this._move.y += 1;
+    if (this._keys.has("KeyQ") || this._keys.has("ControlLeft") || this._keys.has("ControlRight")) this._move.y -= 1;
+    if (this._move.lengthSq() > 0) this.camera.position.add(this._move.normalize().multiplyScalar(step));
+  }
+}
+
+const status_el = document.getElementById("status");
+const set_status = value => { status_el.textContent = value; };
+const canvas = document.getElementById("canvas");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+// Enable real-time shadow mapping. The shadow map is refreshed every frame
+// because all seven characters are animated and skinned.
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.autoUpdate = true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202028);
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 1000);
+camera.position.set(3, 1.2, 3);
+camera.lookAt(0, 0.9, 0);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.05));
+const directional_light = new THREE.DirectionalLight(0xffffff, 2.35);
+directional_light.castShadow = true;
+directional_light.shadow.mapSize.set(2048, 2048);
+directional_light.shadow.camera.near = 0.1;
+directional_light.shadow.camera.far = 60;
+directional_light.shadow.camera.left = -12;
+directional_light.shadow.camera.right = 12;
+directional_light.shadow.camera.top = 8;
+directional_light.shadow.camera.bottom = -8;
+directional_light.shadow.bias = -0.00018;
+directional_light.shadow.normalBias = 0.025;
+directional_light.shadow.radius = 3;
+directional_light.position.set(3, 7, 5);
+scene.add(directional_light);
+// A DirectionalLight target must belong to the scene for its world matrix
+// to be updated consistently when the row layout changes.
+scene.add(directional_light.target);
+
+let fit_camera_to_row = null;
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  if (fit_camera_to_row) fit_camera_to_row();
+});
+
+const controls = new flight_controls(camera, renderer.domElement);
+const timer = new THREE.Timer();
+const mixers = [];
+
+let soldier = null;
+let soldier_rig = null;
+let s_mixer = null;
+let raw_animation_entries = [];
+let prepared_animation_entries = [];
+let s_actions = [];
+let gentleman_models = [];
+let current_anim_index = -1;
+let ik_override = null; // null = anim_urls defaults; boolean = global override
+let rebuild_busy = false;
+let rebuild_pending = false;
+let requested_animation_index = null;
+
+function effective_ik(entry, override) {
+  return override === null ? entry.ik !== false : override;
+}
+
+function update_status() {
+  const defaults = raw_animation_entries.map(entry => entry.ik !== false ? "1" : "0").join(" ");
+  const ik_text = ik_override === null
+    ? `per-animation defaults (${defaults})`
+    : (ik_override ? "ALL ON" : "ALL OFF");
+  set_status(
+    `animation ${current_anim_index + 1} / ${s_actions.length}\n` +
+    `Hips transfer: ON  Position transfer: ON  IK: ${ik_text}`,
+  );
+}
+
+// Character meshes cast shadows onto the ground and receive subtle self-shadowing.
+// This includes SkinnedMesh instances, so shadows follow the animated pose.
+function enable_character_shadows(root) {
+  root.traverse(object => {
+    if (!object.isMesh) return;
+    object.castShadow = true;
+    object.receiveShadow = true;
+  });
+}
+
+// Keep the directional shadow camera fitted to the complete character row.
+// This avoids losing shadows from the outer Gentleman models.
+function fit_directional_shadow_to_row(total_width, max_height) {
+  const center_x = total_width * 0.5;
+  const span_x = Math.max(10, total_width + 4);
+  const span_z = Math.max(9, max_height * 2.2 + 3);
+
+  directional_light.target.position.set(center_x, max_height * 0.32, 0);
+  directional_light.position.set(
+    center_x - span_x * 0.28,
+    Math.max(8, max_height * 3.2),
+    span_z * 0.72,
+  );
+
+  const shadow_camera = directional_light.shadow.camera;
+  shadow_camera.left = -span_x * 0.62;
+  shadow_camera.right = span_x * 0.62;
+  shadow_camera.top = span_z * 0.58;
+  shadow_camera.bottom = -span_z * 0.58;
+  shadow_camera.near = 0.1;
+  shadow_camera.far = Math.max(40, max_height * 9 + 15);
+  shadow_camera.updateProjectionMatrix();
+  directional_light.shadow.needsUpdate = true;
+}
+
+// Place soldier and six target rigs in a single ground-aligned row.
+function recompute_layout() {
+  const actors = [
+    { root: soldier, rig: soldier_rig },
+    ...gentleman_models.map(model => ({ root: model.root, rig: model.rig })),
+  ];
+  const widths = actors.map(actor => Math.max(0.1, actor.rig.bindBox.max.x - actor.rig.bindBox.min.x));
+  const max_width = Math.max(...widths);
+  const gap = Math.max(0.22, max_width * 0.38);
+  let cursor = 0;
+  let max_height = 0;
+
+  actors.forEach((actor, index) => {
+    const box = actor.rig.bindBox;
+    actor.root.position.set(cursor - box.min.x, -actor.rig.groundY, 0);
+    actor.root.updateMatrixWorld(true);
+    cursor += widths[index] + gap;
+    max_height = Math.max(max_height, box.max.y - box.min.y);
+  });
+
+  const total_width = Math.max(1, cursor - gap);
+  const center_x = total_width * 0.5;
+  fit_directional_shadow_to_row(total_width, max_height);
+  fit_camera_to_row = () => {
+    const vertical_fov = THREE.MathUtils.degToRad(camera.fov);
+    const horizontal_fov = 2 * Math.atan(Math.tan(vertical_fov * 0.5) * camera.aspect);
+    const distance_x = (total_width * 0.5) / Math.tan(horizontal_fov * 0.5) * 1.12;
+    const distance_y = (max_height * 0.5) / Math.tan(vertical_fov * 0.5) * 1.55;
+    const distance = Math.max(4.5, distance_x, distance_y);
+    camera.position.set(center_x, Math.max(0.7, max_height * 0.62), distance);
+    camera.lookAt(center_x, max_height * 0.48, 0);
+    controls.sync();
+  };
+  fit_camera_to_row();
+}
+
+function stop_inactive_actions(actions, keep_a, keep_b) {
+  for (const action of actions) {
+    if (action !== keep_a && action !== keep_b) action.stop();
+  }
+}
+
+function play_animation(index, fade_duration = 0.3) {
+  if (index < 0 || index >= s_actions.length) return;
+  if (index === current_anim_index) return;
+
+  const next_entry = prepared_animation_entries[index];
+  const is_one_shot = next_entry?.loop === false;
+  // Keep animation changes consistently smooth. Shortening the cross-fade
+  // to 75–140 ms made transitions visibly abrupt.
+  const transition_fade = Math.max(0, fade_duration);
+  const configure_action = action => {
+    if (is_one_shot) {
+      action.setLoop(THREE.LoopOnce, 1);
+      action.clampWhenFinished = true;
+    } else {
+      action.setLoop(THREE.LoopRepeat, Infinity);
+      action.clampWhenFinished = false;
+    }
+  };
+
+  const previous_soldier = current_anim_index >= 0 ? s_actions[current_anim_index] : null;
+  const next_soldier = s_actions[index];
+  // Cross-fading actions are kept alive only for the current transition.
+  // Stop stale zero-weight actions so repeated switching cannot accumulate
+  // dozens of active mixers and unnecessary per-frame track evaluations.
+  stop_inactive_actions(s_actions, previous_soldier, next_soldier);
+  configure_action(next_soldier);
+  next_soldier.reset().play();
+  if (previous_soldier) {
+    if (transition_fade > 0) previous_soldier.crossFadeTo(next_soldier, transition_fade, false);
+    else previous_soldier.stop();
+  }
+
+  for (const model of gentleman_models) {
+    const previous = current_anim_index >= 0 ? model.actions[current_anim_index] : null;
+    const next = model.actions[index];
+    stop_inactive_actions(model.actions, previous, next);
+    configure_action(next);
+    next.reset().play();
+    if (previous) {
+      if (transition_fade > 0) previous.crossFadeTo(next, transition_fade, false);
+      else previous.stop();
+    }
+  }
+
+  current_anim_index = index;
+  update_status();
+}
+
+const next_frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+
+async function rebuild() {
+  if (rebuild_busy) {
+    rebuild_pending = true;
+    return;
+  }
+  rebuild_busy = true;
+  try {
+    let restore_index = current_anim_index;
+    do {
+      rebuild_pending = false;
+      const override_snapshot = ik_override;
+      const saved_index = current_anim_index >= 0 ? current_anim_index : restore_index;
+
+      if (s_mixer) {
+        s_mixer.stopAllAction();
+        s_mixer.uncacheRoot(soldier);
+      }
+      for (const model of gentleman_models) {
+        model.mixer.stopAllAction();
+        model.mixer.uncacheRoot(model.root);
+      }
+
+      s_actions = prepared_animation_entries.map(entry => s_mixer.clipAction(entry.clip));
+      for (const model of gentleman_models) {
+        model.actions = [];
+      }
+      current_anim_index = -1;
+
+      const total_jobs = prepared_animation_entries.length * gentleman_models.length;
+      let completed_jobs = 0;
+      for (const model of gentleman_models) {
+        for (const entry of prepared_animation_entries) {
+          const clip = retarget_clip(soldier_rig, model.rig, entry.clip, {
+            enable_ik: effective_ik(entry, override_snapshot),
+            looping: entry.loop !== false,
+            arm_space: entry.arm_space,
+          });
+          model.actions.push(model.mixer.clipAction(clip));
+          completed_jobs++;
+          set_status(`retargeting ${model.name} · ${completed_jobs}/${total_jobs}\n` +
+            `IK: ${override_snapshot === null ? "per-animation" : (override_snapshot ? "ALL ON" : "ALL OFF")}`);
+          // Yield between retarget jobs so the browser can paint progress and
+          // process input instead of freezing for the full batch.
+          await next_frame();
+        }
+      }
+
+      recompute_layout();
+      const pending_index = requested_animation_index;
+      const chosen_index = pending_index !== null && pending_index >= 0 && pending_index < s_actions.length
+        ? pending_index
+        : (saved_index >= 0 && saved_index < s_actions.length ? saved_index : 0);
+      requested_animation_index = null;
+      play_animation(chosen_index, 0);
+      restore_index = current_anim_index;
+      update_status();
+
+      // If I was pressed during the build, repeat once with the newest global
+      // override rather than leaving a mixture of old and new IK settings.
+      if (ik_override !== override_snapshot) rebuild_pending = true;
+    } while (rebuild_pending);
+  } finally {
+    rebuild_busy = false;
+  }
+}
+
+async function main() {
+  const loader = new GLTFLoader();
+  set_status(`loading soldier, ${anim_urls.length} animations and ${gentleman_urls.length} gentleman models…`);
+  const soldier_gltf = await loader.loadAsync(soldier_url);
+  const [animationResults, gentlemanGltfs] = await Promise.all([
+    Promise.allSettled(anim_urls.map(entry => loader.loadAsync(entry.url))),
+    Promise.all(gentleman_urls.map(url => loader.loadAsync(url))),
+  ]);
+
+  soldier = soldier_gltf.scene;
+  scene.add(soldier);
+  enable_character_shadows(soldier);
+  soldier_rig = new Rig(soldier);
+
+  animationResults.forEach((result, index) => {
+    const config = anim_urls[index];
+    if (result.status !== "fulfilled") {
+      console.warn("animation не загружена:", config.url, result.reason);
+      return;
+    }
+    const clips = result.value.animations || [];
+    for (const clip of clips) {
+      raw_animation_entries.push({
+        clip,
+        ik: config.ik !== false,
+        loop: config.loop !== false,
+        arm_space: config.arm_space ?? 50,
+      });
+    }
+  });
+  if (!raw_animation_entries.length) throw new Error("animation: нет загруженных клипов");
+
+  gentlemanGltfs.forEach((gltf, index) => {
+    const root = gltf.scene;
+    const name = gentleman_urls[index].split("/").pop().replace(/\.glb$/i, "");
+    scene.add(root);
+    enable_character_shadows(root);
+    let rig;
+    try {
+      rig = new Rig(root);
+    } catch (error) {
+      scene.remove(root);
+      throw new Error(`${name}: ${error.message}`);
+    }
+    gentleman_models.push({
+      name,
+      root,
+      rig,
+      mixer: new THREE.AnimationMixer(root),
+      actions: [],
+    });
+  });
+
+  // Detect source translation units independently for every clip.
+  prepared_animation_entries = raw_animation_entries.map(entry => {
+    const { unit_scale } = detect_unit_scale(entry.clip, soldier_rig.hips);
+    return { ...entry, clip: prepare_clip(entry.clip, unit_scale) };
+  });
+
+  s_mixer = new THREE.AnimationMixer(soldier);
+  mixers.push(s_mixer, ...gentleman_models.map(model => model.mixer));
+  recompute_layout();
+  // A real 100 x 100 metre ground plane. The project uses metre-scale
+  // character units (roughly 1.7 scene units per standing humanoid).
+  const floor_size_meters = 100;
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(floor_size_meters, floor_size_meters),
+    new THREE.MeshStandardMaterial({
+      color: 0x3b3f46,
+      roughness: 0.96,
+      metalness: 0.0,
+    }),
+  );
+  floor.name = "GroundPlane_100m";
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = 0;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  set_status(`retargeting ${prepared_animation_entries.length} clips for ${gentleman_models.length} target rigs…`);
+  await rebuild();
+
+
+
+  controls.setKeyHandler(code => {
+    const digit = /^Digit(\d)$/.exec(code);
+    if (digit) {
+      const index = Number(digit[1]) - 1;
+      if (index >= 0 && index < s_actions.length) {
+        if (rebuild_busy) requested_animation_index = index;
+        else play_animation(index);
+      }
+      return true;
+    }
+    if (code === "KeyI") {
+      // First press forces IK on for every clip; second forces it off.
+      ik_override = ik_override === true ? false : true;
+      void rebuild().catch(error => {
+        console.error(error);
+        set_status("ERROR: " + error.message);
+      });
+      return true;
+    }
+    return false;
+  });
+
+  update_status();
+
+}
+
+main().catch(error => {
+  console.error(error);
+  set_status("ERROR: " + error.message);
+});
+
+renderer.setAnimationLoop(time => {
+  timer.update(time);
+  let dt = timer.getDelta();
+  if (dt > 0.1) dt = 0.1;
+  controls.update(dt);
+  for (let i = 0; i < mixers.length; i++) mixers[i].update(dt);
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
